@@ -32,72 +32,61 @@ class ChatMessage(BaseModel):
     role: str
     content: str
 
+
 class ChatRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
 
 
 # ---------------- Helpers ----------------
 
 def build_prompt(messages: List[ChatMessage]) -> str:
     """
-    Build a prompt using ONLY system + user messages.
-    Assistant messages are ignored.
-    No role tags are added.
+    If the user already sends a Qwen-formatted prompt (<|im_start|>system ...),
+    pass it through unchanged.
+
+    Otherwise, concatenate system + user messages.
     """
+    # Pass-through for preformatted Qwen prompt
+    last_user = next((m for m in reversed(messages) if m.role == "user"), None)
+    if last_user and "<|im_start|>" in last_user.content:
+        return last_user.content
+
+    # Fallback: simple concatenation
     prompt = ""
     for m in messages:
         if m.role in ("system", "user"):
             prompt += m.content + "\n"
     return prompt
 
-"""
-def generate_text(req: ChatRequest) -> str:
-    ""
-    Generate full text in one pass.
-    Do NOT pass temperature/top_p to avoid MLX streaming path.
-    ""
-    prompt = build_prompt(req.messages)
 
-    return generate(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        max_tokens=req.max_tokens or args.max_tokens,
-    )
-"""
 def generate_text(req: ChatRequest) -> str:
     """
-    Generate full text in one pass.
-    Chain-of-thought suppressed using bad_words_ids.
+    Generate text using MLX. No unsupported kwargs.
     """
     prompt = build_prompt(req.messages)
 
-    # Block Qwen reasoning tokens
-    bad_words_ids = [
-        [tokenizer.convert_tokens_to_ids("<think>")],
-        [tokenizer.convert_tokens_to_ids("</think>")],
-        [tokenizer.convert_tokens_to_ids("1.")],   # blocks numbered reasoning
-        [tokenizer.convert_tokens_to_ids("2.")],
-        [tokenizer.convert_tokens_to_ids("3.")],
-    ]
+    gen_kwargs = {
+        "model": model,
+        "tokenizer": tokenizer,
+        "prompt": prompt,
+        "max_tokens": req.max_tokens or args.max_tokens,
+    }
 
-    return generate(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        max_tokens=req.max_tokens or args.max_tokens,
-        bad_words_ids=bad_words_ids,
-        stop=["<think>", "</think>", "1.", "2.", "3."],
-    )
+    if req.temperature is not None:
+        gen_kwargs["temperature"] = req.temperature
+    if req.top_p is not None:
+        gen_kwargs["top_p"] = req.top_p
+
+    return generate(**gen_kwargs)
 
 
 def sse_stream(req: ChatRequest) -> Generator[bytes, None, None]:
     """
-    Stream ONLY the generated text in chunks.
-    No assistant role.
-    No wrapper.
+    Stream the generated text in OpenAI-compatible SSE format.
     """
     full_text = generate_text(req)
 
@@ -127,18 +116,14 @@ def sse_stream(req: ChatRequest) -> Generator[bytes, None, None]:
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
-
     body = await request.json()
 
-    # ⭐ Merge extra_body into top-level JSON (required for OpenAI client)
+    # Merge extra_body (OpenAI client quirk)
     extra = body.get("extra_body", {})
     if isinstance(extra, dict):
         body.update(extra)
 
-    # Parse into ChatRequest
     req = ChatRequest(**body)
-
-    # Read stream flag from merged JSON
     stream_flag = body.get("stream", False)
 
     if stream_flag:
@@ -147,9 +132,23 @@ async def chat(request: Request):
             media_type="text/event-stream",
         )
 
-    # Non-streaming mode: return ONLY the generated text
+    # Non-streaming mode
     text = generate_text(req)
-    return text
+    return {
+        "id": "mlx-chatcmpl",
+        "object": "chat.completion",
+        "model": req.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text,
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
 
 
 # ---------------- Main ----------------
@@ -157,4 +156,5 @@ async def chat(request: Request):
 if __name__ == "__main__":
     print(f"Starting streaming MLX LLM server on http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
+
 
