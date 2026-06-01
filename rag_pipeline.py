@@ -16,6 +16,7 @@ This file is designed to be:
 - Easy to debug
 """
 
+import json
 import requests
 from typing import List
 
@@ -272,11 +273,23 @@ def rag_answer(chain: LLMChain, question: str, k: int = 10) -> str:
     context = "\n\n".join(d.page_content for d in docs)
 
     # 4) Run the LLMChain
+    '''
     answer = chain.run(
         system=system_prompt,
         context=context,
         question=question,
     )
+    '''
+    result = chain.invoke(
+        {
+            "system": system_prompt,
+            "context": context,
+            "question": question,
+        }
+    )
+
+    answer = result["text"]
+    answer = answer.encode().decode("unicode_escape")
 
     return answer
 

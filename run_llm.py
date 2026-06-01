@@ -37,7 +37,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = 2048
 
 
 # ---------------- Helpers ----------------
@@ -101,11 +101,11 @@ def generate_text(req: ChatRequest) -> str:
     )
 
     # Strip chain-of-thought tags if present
-    full_text = re.sub(r"<think>.*</think>", "", full_text, flags=re.DOTALL)
+    full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL)
     full_text = re.sub(r"<think>", "", full_text)
     full_text = re.sub(r"</think>\n", "", full_text)
     full_text.strip()
- 
+
     return full_text
 
 
