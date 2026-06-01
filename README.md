@@ -12,12 +12,33 @@ capabilities that run on Apple M-series hardware.
 
 The servers are in an Alpha state, not extensively tested.
 
-The Jupyter notebook is incomplete, as the RAG implementation is not yet working.
-
 I would welcome contributions to improve the servers towards
 making them production capable.
 
 Working towards tests, requirements.txt, and a more 
 pythonic repo structure. 
 
+Before running the rag pipeline, on your M-series Mac, run:
+
+``` zsh
+ python run_embedding_model.py \
+--model mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ \
+--port 8898 --host 127.0.0.1
+```
+
+(feel free to run a smaller qwen model
+``` zsh
+python run_llm.py \
+  --model mlx-community/Qwen3.6-35B-A3B-4bit \
+  --host 127.0.0.1 \
+  --port 8899
+```
+
+then you can run the rag model:
+
+``` zsh
+python rag_pipeline.py
+```
+
+For now, you will need to manually install dependancies.
 
