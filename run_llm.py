@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 from typing import List, Optional, Generator
 
 import uvicorn
@@ -30,63 +31,89 @@ app = FastAPI()
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str  # we normalize to str before validation
 
 
 class ChatRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
 
 
 # ---------------- Helpers ----------------
 
+def normalize_messages_in_body(body: dict) -> None:
+    """
+    In-place normalization of body["messages"]:
+    - If content is a list, join into a single string.
+    """
+    messages = body.get("messages", [])
+    if not isinstance(messages, list):
+        return
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            # Join list elements into a single string
+            m["content"] = " ".join(str(x) for x in content)
+
+
 def build_prompt(messages: List[ChatMessage]) -> str:
     """
-    If the user already sends a Qwen-formatted prompt (<|im_start|>system ...),
-    pass it through unchanged.
+    Convert OpenAI-style messages into a single Qwen-style prompt.
 
-    Otherwise, concatenate system + user messages.
+    - Use the last system message (if any) as system.
+    - Use the last user message as user.
+    - Ignore assistant messages.
     """
-    # Pass-through for preformatted Qwen prompt
-    last_user = next((m for m in reversed(messages) if m.role == "user"), None)
-    if last_user and "<|im_start|>" in last_user.content:
-        return last_user.content
+    system = ""
+    user = ""
 
-    # Fallback: simple concatenation
-    prompt = ""
     for m in messages:
-        if m.role in ("system", "user"):
-            prompt += m.content + "\n"
-    return prompt
+        content = m.content
+        if m.role == "system":
+            system = content
+        elif m.role == "user":
+            user = content
+
+    return (
+        f"<|im_start|>system\n{system}\n<|im_end|>\n"
+        f"<|im_start|>user\n{user}\n<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
 
 
 def generate_text(req: ChatRequest) -> str:
     """
-    Generate text using MLX. No unsupported kwargs.
+    Generate full text in one pass.
+    Do NOT pass temperature/top_p to avoid MLX streaming path.
+    Also strip Qwen <think> tags.
     """
     prompt = build_prompt(req.messages)
 
-    gen_kwargs = {
-        "model": model,
-        "tokenizer": tokenizer,
-        "prompt": prompt,
-        "max_tokens": req.max_tokens or args.max_tokens,
-    }
+    full_text = generate(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        max_tokens=req.max_tokens or args.max_tokens,
+    )
 
-    if req.temperature is not None:
-        gen_kwargs["temperature"] = req.temperature
-    if req.top_p is not None:
-        gen_kwargs["top_p"] = req.top_p
-
-    return generate(**gen_kwargs)
+    # Strip chain-of-thought tags if present
+    full_text = re.sub(r"<think>.*</think>", "", full_text, flags=re.DOTALL)
+    full_text = re.sub(r"<think>", "", full_text)
+    full_text = re.sub(r"</think>\n", "", full_text)
+    full_text.strip()
+ 
+    return full_text
 
 
 def sse_stream(req: ChatRequest) -> Generator[bytes, None, None]:
     """
-    Stream the generated text in OpenAI-compatible SSE format.
+    Stream ONLY the generated text in chunks.
+    No assistant role.
+    No wrapper beyond OpenAI-like delta format.
     """
     full_text = generate_text(req)
 
@@ -96,6 +123,9 @@ def sse_stream(req: ChatRequest) -> Generator[bytes, None, None]:
     while idx < len(full_text):
         piece = full_text[idx:idx + chunk_size]
         idx += chunk_size
+
+        # Safety: strip think tags in case they appear mid-chunk
+        #piece = piece.replace("<think>", "").replace("</think>", "")
 
         data = {
             "choices": [
@@ -118,12 +148,18 @@ def sse_stream(req: ChatRequest) -> Generator[bytes, None, None]:
 async def chat(request: Request):
     body = await request.json()
 
-    # Merge extra_body (OpenAI client quirk)
+    # Merge extra_body into top-level JSON (for OpenAI-compatible clients)
     extra = body.get("extra_body", {})
     if isinstance(extra, dict):
         body.update(extra)
 
+    # Normalize messages so Pydantic sees content as str, not list
+    normalize_messages_in_body(body)
+
+    # Parse into ChatRequest
     req = ChatRequest(**body)
+
+    # Read stream flag from merged JSON
     stream_flag = body.get("stream", False)
 
     if stream_flag:
@@ -132,23 +168,9 @@ async def chat(request: Request):
             media_type="text/event-stream",
         )
 
-    # Non-streaming mode
+    # Non-streaming mode: return ONLY the generated text
     text = generate_text(req)
-    return {
-        "id": "mlx-chatcmpl",
-        "object": "chat.completion",
-        "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text,
-                },
-                "finish_reason": "stop",
-            }
-        ]
-    }
+    return text
 
 
 # ---------------- Main ----------------

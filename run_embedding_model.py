@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 from typing import Union, List
 
 from fastapi import FastAPI
@@ -7,11 +8,26 @@ from pydantic import BaseModel
 from mlx_embeddings.utils import load
 import uvicorn
 
+
 # --------------------------------------------------
-# Model
+# CLI ARGUMENTS
 # --------------------------------------------------
 
-MODEL_NAME = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+parser = argparse.ArgumentParser(description="MLX Embedding Server")
+parser.add_argument("--model", type=str, required=True,
+                    help="Embedding model name (HuggingFace or MLX repo)")
+parser.add_argument("--host", type=str, default="127.0.0.1",
+                    help="Host to bind the server")
+parser.add_argument("--port", type=int, default=8898,
+                    help="Port to bind the server")
+args = parser.parse_args()
+
+MODEL_NAME = args.model
+
+
+# --------------------------------------------------
+# Load Model
+# --------------------------------------------------
 
 print(f"Loading embedding model: {MODEL_NAME}")
 model, tokenizer = load(MODEL_NAME)
@@ -37,11 +53,52 @@ class EmbeddingRequest(BaseModel):
 
 
 # --------------------------------------------------
-# Helper: Generate Embeddings
+# Input Normalization
+# --------------------------------------------------
+
+def normalize_to_text_list(raw_input) -> List[str]:
+    """
+    Normalize OpenAI-style embedding input into List[str].
+
+    Supports:
+    - "hello"
+    - ["hello", "world"]
+    - [123, 456]  (tokenized single sequence)
+    - [[123, 456], [789]] (batch of tokenized sequences)
+    """
+
+    # Single string
+    if isinstance(raw_input, str):
+        return [raw_input]
+
+    # List input
+    if isinstance(raw_input, list) and len(raw_input) > 0:
+
+        # List[str]
+        if isinstance(raw_input[0], str):
+            return raw_input
+
+        # List[int] → decode single tokenized sequence
+        if isinstance(raw_input[0], int):
+            return [tokenizer.decode(raw_input)]
+
+        # List[List[int]] → decode batch of tokenized sequences
+        if isinstance(raw_input[0], list):
+            return [tokenizer.decode(tokens) for tokens in raw_input]
+
+        raise ValueError(f"Unsupported list element type: {type(raw_input[0])}")
+
+    raise ValueError(f"Unsupported input type: {type(raw_input)}")
+
+
+# --------------------------------------------------
+# Embedding Generation
 # --------------------------------------------------
 
 def generate_embeddings(texts: List[str]) -> List[List[float]]:
-    """Generate embeddings for a batch of texts."""
+    """
+    Generate embeddings for a batch of texts.
+    """
     inputs = tokenizer(
         texts,
         padding=True,
@@ -60,45 +117,13 @@ def generate_embeddings(texts: List[str]) -> List[List[float]]:
 @app.post("/v1/embeddings")
 def create_embedding(req: EmbeddingRequest):
 
-    raw_input = req.input
-    print("\n=== /v1/embeddings CALLED ===")
-    print("RAW INPUT TYPE:", type(raw_input))
-    print("RAW INPUT VALUE:", repr(raw_input))
+    try:
+        texts = normalize_to_text_list(req.input)
+    except Exception as e:
+        return {"error": str(e)}
 
-    # -------------------------------
-    # Normalize input into List[str]
-    # -------------------------------
-
-    if isinstance(raw_input, str):
-        texts = [raw_input]
-
-    elif isinstance(raw_input, list) and len(raw_input) > 0:
-
-        if isinstance(raw_input[0], str):
-            texts = raw_input
-
-        elif isinstance(raw_input[0], int):
-            # Single tokenized document
-            texts = [tokenizer.decode(raw_input)]
-
-        elif isinstance(raw_input[0], list):
-            # Batch of tokenized documents
-            texts = [tokenizer.decode(tokens) for tokens in raw_input]
-
-        else:
-            return {"error": f"Unsupported list element type: {type(raw_input[0])}"}
-
-    else:
-        return {"error": f"Unsupported input type: {type(raw_input)}"}
-
-    print("NORMALIZED TEXT COUNT:", len(texts))
-
-    # Generate embeddings
     embeddings = generate_embeddings(texts)
 
-    print("GENERATED EMBEDDINGS:", len(embeddings))
-
-    # Build OpenAI-style response
     data = []
     total_tokens = 0
 
@@ -159,9 +184,11 @@ def models():
 # --------------------------------------------------
 
 if __name__ == "__main__":
+    print(f"Starting MLX Embedding server on http://{args.host}:{args.port}")
     uvicorn.run(
         app,
-        host="127.0.0.1",
-        port=8898
+        host=args.host,
+        port=args.port
     )
+
 
