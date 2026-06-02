@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import argparse
 import json
 import re
@@ -6,28 +7,81 @@ from typing import List, Optional, Generator
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from mlx_lm import load, generate
+from mlx_lm.sample_utils import make_sampler
 
 
-# ---------------- CLI args ----------------
+# --------------------------------------------------
+# CLI Arguments
+# --------------------------------------------------
 
-parser = argparse.ArgumentParser(description="MLX LLM Streaming Server")
-parser.add_argument("--model", type=str, required=True)
-parser.add_argument("--host", type=str, default="127.0.0.1")
-parser.add_argument("--port", type=int, default=8899)
-parser.add_argument("--max-tokens", type=int, default=512)
+parser = argparse.ArgumentParser(description="MLX OpenAI-Compatible Server")
+
+parser.add_argument(
+    "--model",
+    type=str,
+    required=True,
+    help="MLX model path"
+)
+
+parser.add_argument(
+    "--host",
+    type=str,
+    default="127.0.0.1"
+)
+
+parser.add_argument(
+    "--port",
+    type=int,
+    default=8899
+)
+
+parser.add_argument(
+    "--max-tokens",
+    type=int,
+    default=2048
+)
+
+parser.add_argument(
+    "--temperature",
+    type=float,
+    default=0.7
+)
+
+parser.add_argument(
+    "--top-p",
+    type=float,
+    default=0.95
+)
+
+parser.add_argument(
+    "--top-k",
+    type=int,
+    default=50
+)
+
 args = parser.parse_args()
 
+
+# --------------------------------------------------
+# Load Model
+# --------------------------------------------------
+
 print(f"Loading model: {args.model}")
+
 model, tokenizer = load(args.model)
+
+print("Model loaded.")
 
 app = FastAPI()
 
 
-# ---------------- Schemas ----------------
+# --------------------------------------------------
+# Schemas
+# --------------------------------------------------
 
 class ChatMessage(BaseModel):
     role: str
@@ -37,97 +91,156 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    max_tokens: Optional[int] = 2048
+
+    max_tokens: Optional[int] = None
+
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
 
 
-# ---------------- Helpers ----------------
+# --------------------------------------------------
+# Helpers
+# --------------------------------------------------
 
 def normalize_messages_in_body(body: dict) -> None:
     """
-    In-place normalization of body["messages"]:
-    - If content is a list, join into a single string.
+    Convert OpenAI message content lists into strings.
     """
+
     messages = body.get("messages", [])
+
     if not isinstance(messages, list):
         return
 
-    for m in messages:
-        if not isinstance(m, dict):
+    for msg in messages:
+        if not isinstance(msg, dict):
             continue
-        content = m.get("content")
+
+        content = msg.get("content")
+
         if isinstance(content, list):
-            # Join list elements into a single string
-            m["content"] = " ".join(str(x) for x in content)
+            msg["content"] = " ".join(
+                str(x)
+                for x in content
+            )
 
 
 def build_prompt(messages: List[ChatMessage]) -> str:
     """
-    Convert OpenAI-style messages into a single Qwen-style prompt.
-
-    - Use the last system message (if any) as system.
-    - Use the last user message as user.
-    - Ignore assistant messages.
+    Convert OpenAI messages into a Qwen chat prompt.
     """
+
     system = ""
-    user = ""
+    conversation = []
 
     for m in messages:
-        content = m.content
-        if m.role == "system":
-            system = content
-        elif m.role == "user":
-            user = content
 
-    return (
+        if m.role == "system":
+            system = m.content
+
+        elif m.role == "user":
+            conversation.append(
+                f"<|im_start|>user\n{m.content}\n<|im_end|>"
+            )
+
+        elif m.role == "assistant":
+            conversation.append(
+                f"<|im_start|>assistant\n{m.content}\n<|im_end|>"
+            )
+
+    prompt = (
         f"<|im_start|>system\n{system}\n<|im_end|>\n"
-        f"<|im_start|>user\n{user}\n<|im_end|>\n"
-        f"<|im_start|>assistant\n"
+        + "\n".join(conversation)
+        + "\n<|im_start|>assistant\n"
     )
+
+    return prompt
+
+
+def strip_think_tags(text: str) -> str:
+
+    text = re.sub(
+        r"<think>.*?</think>",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+
+    text = text.replace("<think>", "")
+    text = text.replace("</think>", "")
+
+    return text.strip()
 
 
 def generate_text(req: ChatRequest) -> str:
-    """
-    Generate full text in one pass.
-    Do NOT pass temperature/top_p to avoid MLX streaming path.
-    Also strip Qwen <think> tags.
-    """
+
     prompt = build_prompt(req.messages)
 
-    full_text = generate(
+    temperature = (
+        req.temperature
+        if req.temperature is not None
+        else args.temperature
+    )
+
+    top_p = (
+        req.top_p
+        if req.top_p is not None
+        else args.top_p
+    )
+
+    top_k = (
+        req.top_k
+        if req.top_k is not None
+        else args.top_k
+    )
+
+    max_tokens = (
+        req.max_tokens
+        if req.max_tokens is not None
+        else args.max_tokens
+    )
+
+    sampler = make_sampler(
+        temp=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    )
+
+    text = generate(
         model=model,
         tokenizer=tokenizer,
         prompt=prompt,
-        max_tokens=req.max_tokens or args.max_tokens,
+        max_tokens=max_tokens,
+        sampler=sampler,
     )
 
     # Strip chain-of-thought tags if present
-    full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL)
-    full_text = re.sub(r"<think>", "", full_text)
-    full_text = re.sub(r"</think>\n", "", full_text)
-    full_text.strip()
+    #full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL)
+    #full_text = re.sub(r"<think>", "", full_text)
+    #full_text = re.sub(r"</think>\n", "", full_text)
+    #full_text.strip()
 
-    return full_text
+    return strip_think_tags(text)
 
 
-def sse_stream(req: ChatRequest) -> Generator[bytes, None, None]:
-    """
-    Stream ONLY the generated text in chunks.
-    No assistant role.
-    No wrapper beyond OpenAI-like delta format.
-    """
-    full_text = generate_text(req)
+# --------------------------------------------------
+# SSE Streaming
+# --------------------------------------------------
+
+def sse_stream(
+    req: ChatRequest
+) -> Generator[bytes, None, None]:
+
+    text = generate_text(req)
 
     chunk_size = 50
-    idx = 0
 
-    while idx < len(full_text):
-        piece = full_text[idx:idx + chunk_size]
-        idx += chunk_size
+    for i in range(0, len(text), chunk_size):
 
-        # Safety: strip think tags in case they appear mid-chunk
-        #piece = piece.replace("<think>", "").replace("</think>", "")
+        piece = text[i:i + chunk_size]
 
-        data = {
+        payload = {
             "choices": [
                 {
                     "delta": {
@@ -137,19 +250,24 @@ def sse_stream(req: ChatRequest) -> Generator[bytes, None, None]:
             ]
         }
 
-        yield f"data: {json.dumps(data)}\n\n".encode("utf-8")
+        yield (
+            f"data: {json.dumps(payload)}\n\n"
+        ).encode("utf-8")
 
     yield b"data: [DONE]\n\n"
 
 
-# ---------------- Route ----------------
+# --------------------------------------------------
+# Route
+# --------------------------------------------------
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
+
     body = await request.json()
 
-    # Merge extra_body into top-level JSON (for OpenAI-compatible clients)
-    extra = body.get("extra_body", {})
+    extra = body.get("extra_body")
+
     if isinstance(extra, dict):
         body.update(extra)
 
@@ -159,10 +277,10 @@ async def chat(request: Request):
     # Parse into ChatRequest
     req = ChatRequest(**body)
 
-    # Read stream flag from merged JSON
-    stream_flag = body.get("stream", False)
+    stream = body.get("stream", False)
 
-    if stream_flag:
+    if stream:
+
         return StreamingResponse(
             sse_stream(req),
             media_type="text/event-stream",
@@ -172,11 +290,42 @@ async def chat(request: Request):
     text = generate_text(req)
     return text
 
+    return JSONResponse(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": text,
+                    }
+                }
+            ]
+        }
+    )
 
-# ---------------- Main ----------------
+
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
 
 if __name__ == "__main__":
     print(f"Starting streaming MLX LLM server on http://{args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port)
 
+    print(
+        f"Starting MLX server on "
+        f"http://{args.host}:{args.port}"
+    )
+
+    print(
+        f"Defaults: "
+        f"temperature={args.temperature}, "
+        f"top_p={args.top_p}, "
+        f"top_k={args.top_k}"
+    )
+
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+    )
 
