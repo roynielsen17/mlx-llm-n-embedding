@@ -192,16 +192,8 @@ def build_vectorstore(
 # 5. Build RAG chain (retriever + prompt + LLM)
 # ============================================================
 
-def build_rag_chain(vectorstore: Chroma) -> LLMChain:
-    """
-    Create a LangChain LLMChain that:
+def build_rag_chain(vectorstore: Chroma):
 
-    - Retrieves relevant chunks from Chroma
-    - Injects them into a prompt template
-    - Calls your MLX Qwen LLM server
-    """
-
-    # System instructions for the model
     system_prompt = (
         "You are an academic research assistant. "
         "Use ONLY the retrieved context. "
@@ -209,10 +201,6 @@ def build_rag_chain(vectorstore: Chroma) -> LLMChain:
         "Answer concisely and factually."
     )
 
-    # Prompt template:
-    # - {system}: system instructions
-    # - {context}: retrieved text chunks
-    # - {question}: user question
     template = """
 {system}
 
@@ -230,16 +218,11 @@ Answer:
         template=template,
     )
 
-    # Your MLX Qwen LLM wrapper
     llm = MLXQwenChat()
 
-    # LLMChain: prompt → LLM → string
-    chain = LLMChain(
-        llm=llm,
-        prompt=prompt,
-    )
+    chain = prompt | llm
 
-    # Attach retriever to the chain via closure (see rag_answer below)
+    # attach custom state
     chain._vectorstore = vectorstore
     chain._system_prompt = system_prompt
 
@@ -267,19 +250,12 @@ def rag_answer(chain: LLMChain, question: str, k: int = 10) -> str:
     retriever = vectorstore.as_retriever(search_kwargs={"k": k})
 
     # 2) Retrieve relevant documents
-    docs = retriever.get_relevant_documents(question)
+    docs = retriever.invoke(question)
 
     # 3) Concatenate their content into a single context string
     context = "\n\n".join(d.page_content for d in docs)
 
     # 4) Run the LLMChain
-    '''
-    answer = chain.run(
-        system=system_prompt,
-        context=context,
-        question=question,
-    )
-    '''
     result = chain.invoke(
         {
             "system": system_prompt,
@@ -288,10 +264,8 @@ def rag_answer(chain: LLMChain, question: str, k: int = 10) -> str:
         }
     )
 
-    answer = result["text"]
-    answer = answer.encode().decode("unicode_escape")
-
-    return answer
+    answer = result.encode().decode("unicode_escape")
+    return answer.strip('"').strip()
 
 
 # ============================================================
